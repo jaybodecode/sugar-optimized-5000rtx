@@ -411,8 +411,6 @@ localhostForwarding=true
 
 ---
 
-## � TensorBoard Monitoring
-
 <details>
 <summary><h2>📊 TensorBoard Monitoring</h2></summary>
 
