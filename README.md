@@ -634,9 +634,29 @@ SuGaR automatically logs `Training_Guide` with:
 
 ### Training Expectations (Garden Scene)
 
-| Phase | Loss Range | PSNR | VRAM | Gaussians | Time |
-|-------|------------|------|------|-----------|------|
-| *
+**Mip-Splatting (Resolution -r2, ~5MP images)**
+
+| Phase | Iterations | Loss | PSNR | SSIM | LPIPS | VRAM | Gaussians | Speed |
+|-------|------------|------|------|------|-------|------|-----------|-------|
+| **Initialization** | 0-500 | 0.15-0.08 | 15-20 | 0.60-0.75 | 0.25-0.15 | 11-13 GB | 50K→500K | 2-4 it/s |
+| **Densification** | 500-15K | 0.08-0.02 | 20-27 | 0.75-0.90 | 0.15-0.05 | 13-15 GB | 500K→5M | 4-7 it/s |
+| **Stable Training** | 15K-40K | 0.02-0.015 | 27-30 | 0.90-0.93 | 0.05-0.03 | 15-16 GB | 5-6M (stable) | 6-8 it/s |
+
+**SuGaR Training (from 40K Mip-Splatting checkpoint)**
+
+| Phase | Iterations | Loss | PSNR | SSIM | LPIPS | VRAM | Vertices | Speed |
+|-------|------------|------|------|-------|------|------|----------|-------|
+| **Coarse Training** | 40K-50K | 0.015-0.012 | 28-30 | TBA | TBA | 11-12 GB | - | 1.0-1.2 it/s |
+| **Mesh Extraction** | - | - | - | - | - | 12-14 GB | 5M verts | ~30-60 min |
+| **Refinement (long)** | 15K iter | 0.010-0.008 | 29-31 | TBA | TBA | 13-15 GB | 5M verts | 1.5-2.5 it/s |
+
+**Total Pipeline Time (RTX 5060 Ti 16GB, -r2):** ~12-15 hours (Mip: ~6-8h, SuGaR: ~6-7h)
+
+**Notes:**
+- VRAM values with Phase 1 optimizations (progressive warmup, reduced SDF samples)
+- SSIM/LPIPS for SuGaR: Metrics implementation in progress
+- Speed varies with neighbor resets and VRAM pressure
+
 SuGaR automatically logs a training guide to TensorBoard's TEXT tab with:
 - Expected loss ranges for Garden scene
 - Parameter stability thresholds
