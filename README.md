@@ -168,14 +168,6 @@ python train_full_pipeline.py \
 - RTX 5080 (16GB): ~60-80% faster - **Use -r2 for high-res datasets** (more CUDA cores, 256-bit bus)
 - RTX 5090 (32GB): ~2-3× faster - **Can use -r1 for full resolution** (21,760 cores, 384-bit bus, 32GB VRAM)
 
-**⚠️ Resolution Guidelines for Sample Dataset (Garden @ ~20MP):**
-- **16GB VRAM or less:** Must use `-r 2` (half-res) to avoid OOM errors
-- **32GB VRAM:** Can use `-r 1` (full-res) for maximum quality
-
-**Scene complexity scales linearly with image count.** Expect:
-- Small scenes (50-100 images): 50-60% of above times
-- Large scenes (200-300 images): 150-200% of above times
-
 ---
 
 ### Production Results (Verified at Iter 7200/15000)
@@ -218,7 +210,8 @@ This demonstrates the effectiveness of lazy loading, half-resolution depth maps,
 
 ---
 
-### Comprehensive Optimization List
+<details>
+<summary><h3>Comprehensive Optimization List</h3></summary>
 
 This project implements **25+ optimizations** across MIPS training, SuGaR training, NVIDIA/CUDA acceleration, and system-level improvements. All optimizations have been tested on RTX 5060 Ti 16GB (Blackwell architecture).
 
@@ -286,6 +279,8 @@ This project implements **25+ optimizations** across MIPS training, SuGaR traini
 - [DOCS/VRAM_OPTIMIZATION.md](DOCS/VRAM_OPTIMIZATION.md) - General VRAM strategies
 - [NOGIT/CUDA_OPTIMIZATION_PLAN.md](NOGIT/CUDA_OPTIMIZATION_PLAN.md) - Phased implementation roadmap
 
+</details>
+
 ---
 
 ## 📋 Requirements
@@ -304,7 +299,8 @@ This project implements **25+ optimizations** across MIPS training, SuGaR traini
 
 ---
 
-## 🔧 Installation
+<details>
+<summary><h2>🔧 Installation</h2></summary>
 
 ### Quick Install (Ubuntu / WSL2)
 
@@ -411,9 +407,14 @@ localhostForwarding=true
 - 🤖 **[LLM.MD](LLM.MD)** - Context for AI assistants, document structure, workflows
 - 📋 **[TODO.MD](TODO.MD)** - Planned features and future work
 
+</details>
+
 ---
 
 ## � TensorBoard Monitoring
+
+<details>
+<summary><h2>📊 TensorBoard Monitoring</h2></summary>
 
 Both Mip-Splatting and SuGaR include comprehensive TensorBoard logging for real-time training monitoring. Access dashboards via web browser while training runs.
 
@@ -685,9 +686,11 @@ SuGaR automatically logs a training guide to TensorBoard's TEXT tab with:
 
 *Coming soon: Example TensorBoard dashboards showing typical training curves and histograms*
 
+</details>
+
 ---
 
-## �🙏 Built On Amazing Research
+## 🙏 Built On Amazing Research
 
 This project combines and optimizes several cutting-edge techniques:
 
