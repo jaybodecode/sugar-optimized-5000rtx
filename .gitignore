@@ -164,6 +164,7 @@ datasets/
 *.fbx
 
 # Images (training data)
+# NOTE: IMAGES/ directory is EXCLUDED from this rule (needed for README)
 *.jpg
 *.jpeg
 *.png
@@ -171,6 +172,11 @@ datasets/
 *.bmp
 *.tiff
 *.tif
+
+# Exception: Allow IMAGES/ directory (documentation images)
+!IMAGES/*.png
+!IMAGES/*.jpg
+!IMAGES/*.jpeg
 
 # Videos
 *.mp4
