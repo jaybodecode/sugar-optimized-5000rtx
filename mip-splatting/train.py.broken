@@ -1,0 +1,1112 @@
+#
+# Copyright (C) 2023, Inria
+# GRAPHDECO research group, https://team.inria.fr/graphdeco
+# All rights reserved.
+#
+# This software is free for non-commercial, research and evaluation use 
+# under the terms of the LICENSE.md file.
+#
+# For inquiries contact  george.drettakis@inria.fr
+#
+
+import os
+import time
+import numpy as np
+import open3d as o3d
+import cv2
+import torch
+import random
+from random import randint
+from datetime import datetime
+from utils.loss_utils import l1_loss, ssim
+from gaussian_renderer import render, network_gui
+import sys
+
+# Disable IPython/Jupyter automatic timestamp formatting
+if hasattr(sys.stdout, '_new_lines'):
+    sys.stdout._new_lines = False
+if hasattr(sys.stderr, '_new_lines'):
+    sys.stderr._new_lines = False
+
+# Add parent directory to path for console_logger
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import console_logger as log
+
+from scene import Scene, GaussianModel
+from utils.general_utils import safe_state
+import uuid
+from tqdm import tqdm
+from utils.image_utils import psnr
+from argparse import ArgumentParser, Namespace
+from arguments import ModelParams, PipelineParams, OptimizationParams
+import gc  # Python garbage collection
+from rich.table import Table
+
+# Get console instance for Progress bars
+CONSOLE = log.get_console()
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_FOUND = True
+except ImportError:
+    TENSORBOARD_FOUND = False
+
+# Import system monitoring
+import psutil
+import subprocess
+
+# RTX 50 Series (Blackwell) Optimizations
+torch.backends.cuda.matmul.allow_tf32 = True      # TF32 acceleration for matmul
+torch.backends.cudnn.allow_tf32 = True            # TF32 acceleration for cuDNN
+torch.backends.cudnn.benchmark = True             # Auto-tune for optimal algorithms
+# Note: expandable_segments disabled due to free() pointer corruption with custom CUDA modules
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# Global variable for tracking Gaussian count changes
+prev_gaussian_count = None
+
+def get_system_resources():
+    """Get current VRAM, RAM, and CPU usage with percentages."""
+    resources = {}
+    
+    # VRAM monitoring - use mem_get_info for actual GPU memory usage
+    if torch.cuda.is_available():
+        mem_free, mem_total = torch.cuda.mem_get_info()  # Returns (free, total) in bytes
+        vram_total = mem_total / (1024**3)  # GB
+        vram_used = (mem_total - mem_free) / (1024**3)  # GB
+        vram_percent = (vram_used / vram_total) * 100
+        resources['vram_gb'] = vram_used
+        resources['vram_total_gb'] = vram_total
+        resources['vram_percent'] = vram_percent
+    else:
+        resources['vram_gb'] = 0
+        resources['vram_total_gb'] = 0
+        resources['vram_percent'] = 0
+    
+    # RAM monitoring
+    ram_info = psutil.virtual_memory()
+    resources['ram_gb'] = ram_info.used / (1024**3)
+    resources['ram_total_gb'] = ram_info.total / (1024**3)
+    resources['ram_percent'] = ram_info.percent
+    
+    # CPU monitoring
+    resources['cpu_percent'] = psutil.cpu_percent(interval=0)  # interval=0 for non-blocking
+    
+    return resources
+
+def print_memory_mode(args):
+    """Print memory loading strategy."""
+    if getattr(args, 'high_dram', False):
+        log.log("⚡ [yellow]Eager loading enabled[/yellow] (all images in RAM at startup)")
+        log.log("  [dim]→ Faster training but requires ~8GB RAM for 185 images[/dim]")
+    else:
+        cache_size = getattr(args, 'image_cache_size', 20)
+        log.log(f"✓ [green]Lazy loading enabled[/green] (LRU cache: {cache_size} images)")
+        log.log(f"  [dim]→ Keeps last {cache_size} images in RAM, loads others on-demand[/dim]")
+        log.log(f"  [dim]→ Use --image_cache_size to adjust (5-50 images)[/dim]")
+        log.log("  [dim]→ Use --high_dram for faster training if you have enough RAM[/dim]")
+
+@torch.no_grad()
+def create_offset_gt(image, offset):
+    height, width = image.shape[1:]
+    meshgrid = np.meshgrid(range(width), range(height), indexing='xy')
+    id_coords = np.stack(meshgrid, axis=0).astype(np.float32)
+    id_coords = torch.from_numpy(id_coords).cuda()
+    
+    id_coords = id_coords.permute(1, 2, 0) + offset
+    id_coords[..., 0] /= (width - 1)
+    id_coords[..., 1] /= (height - 1)
+    id_coords = id_coords * 2 - 1
+    
+    image = torch.nn.functional.grid_sample(image[None], id_coords[None], align_corners=True, padding_mode="border")[0]
+    return image
+
+def log_config_text(tb_writer, dataset, opt, scene):
+    """Log configuration tables to TensorBoard TEXT tab."""
+    if not tb_writer:
+        return
+    
+    # Get GPU info
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
+    gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3) if torch.cuda.is_available() else 0
+    
+    # Get camera info from first training camera
+    train_cams = scene.getTrainCameras()
+    first_cam = train_cams[0] if train_cams else None
+    
+    # Extract COLMAP camera model and 3D point info
+    camera_model = "N/A"
+    focal_length = "N/A"
+    image_size = "N/A"
+    training_resolution = "N/A"
+    resolution_note = ""
+    sparse_points = "N/A"
+    
+    if first_cam:
+        # Image dimensions (original, before downsampling)
+        orig_width = first_cam.image_width
+        orig_height = first_cam.image_height
+        image_size = f"{orig_width} x {orig_height} px"
+        
+        # Calculate actual training resolution after -r downsampling
+        if dataset.resolution > 1:
+            train_width = orig_width // dataset.resolution
+            train_height = orig_height // dataset.resolution
+            training_resolution = f"{train_width} x {train_height} px"
+            resolution_note = f" (downsampled by -r {dataset.resolution})"
+        else:
+            training_resolution = image_size
+            resolution_note = " (full resolution)"
+        
+        # Focal length (convert from FoV back to pixels for first camera)
+        from utils.graphics_utils import fov2focal
+        focal_x = fov2focal(first_cam.FoVx, orig_width)
+        focal_y = fov2focal(first_cam.FoVy, orig_height)
+        if abs(focal_x - focal_y) < 1.0:
+            focal_length = f"{focal_x:.1f} px (SIMPLE_PINHOLE)"
+            camera_model = "SIMPLE_PINHOLE"
+        else:
+            focal_length = f"fx={focal_x:.1f}, fy={focal_y:.1f} px (PINHOLE)"
+            camera_model = "PINHOLE"
+    
+    # Try to get 3D point count from initial point cloud
+    try:
+        ply_path = os.path.join(dataset.source_path, "sparse/0/points3D.ply")
+        if os.path.exists(ply_path):
+            from plyfile import PlyData
+            plydata = PlyData.read(ply_path)
+            sparse_points = f"{len(plydata['vertex']):,}"
+    except:
+        pass
+    
+    # Config/01_Dataset
+    dataset_info = f"""
+## 📊 Dataset & Camera Information
+
+| Property | Value |
+|----------|-------|
+| **Scene Name** | {os.path.basename(dataset.source_path)} |
+| **Training Views** | {len(scene.getTrainCameras())} images |
+| **Test Views** | {len(scene.getTestCameras())} images |
+| **Image Size (Original)** | {image_size} |
+| **Training Resolution** | **{training_resolution}**{resolution_note} |
+| **Resolution Divisor (-r)** | {dataset.resolution} |
+| **Camera Model** | {camera_model} (COLMAP reconstruction) |
+| **Focal Length** | {focal_length} |
+| **COLMAP Sparse Points** | {sparse_points} (initial 3D reconstruction) |
+| **Background Color** | {'White (1.0)' if dataset.white_background else 'Black (0.0)'} |
+| **SH Degree** | {dataset.sh_degree} (max spherical harmonics order for view-dependent color) |
+| **Kernel Size** | {dataset.kernel_size} (anti-aliasing filter size) |
+| **Ray Jitter** | {'✅ Enabled (reduces aliasing)' if dataset.ray_jitter else '❌ Disabled'} |
+| **Resample GT** | {'✅ Enabled (GT images resampled to match render resolution)' if dataset.resample_gt_image else '❌ Disabled'} |
+
+⚠️ **PSNR Comparison Note:** Only compare PSNR between models trained at the SAME resolution!  
+Lower resolution (-r 8) will show higher PSNR but worse quality. Higher resolution (-r 1) will show lower PSNR but best quality.
+"""
+    tb_writer.add_text('Config/01_Dataset', dataset_info, 0)
+    
+    # Config/02_Optimization
+    opt_info = f"""
+## ⚙️ Optimization Parameters
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| **Total Iterations** | {opt.iterations:,} | Training steps (full training duration) |
+| **Position LR (init→final)** | {opt.position_lr_init:.6f} → {opt.position_lr_final:.10f} | Gaussian center positions (decays over training) |
+| **Feature LR** | {opt.feature_lr:.6f} | SH color coefficients (view-dependent appearance) |
+| **Opacity LR** | {opt.opacity_lr:.6f} | Transparency values (0=transparent, 1=opaque) |
+| **Scaling LR** | {opt.scaling_lr:.6f} | Gaussian size/radius in 3D space |
+| **Rotation LR** | {opt.rotation_lr:.6f} | Gaussian orientation (quaternion) |
+| **λ DSSIM** | {opt.lambda_dssim:.4f} | Structural similarity weight (0.2 = 20% SSIM, 80% L1) |
+| **Densify Grad Threshold** | {opt.densify_grad_threshold:.6f} | View-space gradient threshold to split/clone gaussians |
+| **Densification Interval** | {opt.densification_interval} iters | Check every N iterations for under-reconstructed areas |
+| **Opacity Reset Interval** | {opt.opacity_reset_interval:,} iters | Reset low-opacity gaussians to prevent floaters |
+| **Densify From** | {opt.densify_from_iter:,} iters | Start adding gaussians (initial warmup period) |
+| **Densify Until** | {opt.densify_until_iter:,} iters | Stop adding gaussians (refinement-only after this) |
+| **Percent Dense** | {opt.percent_dense:.4f} | Spatial extent threshold for densification culling |
+"""
+    tb_writer.add_text('Config/02_Optimization', opt_info, 0)
+    
+    # Config/03_Performance
+    memory_mode = "Eager Loading (all in RAM)" if getattr(dataset, 'high_dram', False) else f"Lazy Loading (LRU cache: {getattr(dataset, 'image_cache_size', 20)} images)"
+    data_device = dataset.data_device if hasattr(dataset, 'data_device') else "cuda"
+    
+    # Get PCIe info
+    pcie_info = "N/A"
+    try:
+        import subprocess
+        result = subprocess.run(['nvidia-smi', '--query-gpu=pcie.link.gen.current,pcie.link.width.current', '--format=csv,noheader,nounits'], 
+                              capture_output=True, text=True, timeout=1)
+        if result.returncode == 0:
+            values = result.stdout.strip().split(',')
+            if len(values) >= 2:
+                pcie_gen = values[0].strip()
+                pcie_width = values[1].strip()
+                pcie_info = f"Gen {pcie_gen} x{pcie_width}"
+    except:
+        pass
+    
+    perf_info = f"""
+## 💾 Memory & Performance
+
+| Setting | Value |
+|---------|-______|
+| **GPU Model** | {gpu_name} |
+| **VRAM** | {gpu_memory_gb:.1f} GB |
+| **PCIe Bus** | {pcie_info} |
+| **TF32 Acceleration** | ✅ Enabled |
+| **cuDNN Benchmark** | ✅ Enabled |
+| **Memory Mode** | {memory_mode} |
+| **Data Device** | {data_device.upper()} |
+| **3D Filter Updates** | Every 100 iters (after densification) |
+| **Kernel Size** | {dataset.kernel_size} |
+"""
+    tb_writer.add_text('Config/03_Performance', perf_info, 0)
+
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+    global prev_gaussian_count
+    
+    first_iter = 0
+    print_memory_mode(dataset)
+    tb_writer = prepare_output_and_logger(dataset)
+    gaussians = GaussianModel(dataset.sh_degree)
+    scene = Scene(dataset, gaussians)
+    gaussians.training_setup(opt)
+    if checkpoint:
+        (model_params, first_iter) = torch.load(checkpoint)
+        gaussians.restore(model_params, opt)
+    
+    # Log configuration tables to TensorBoard TEXT tab
+    log_config_text(tb_writer, dataset, opt, scene)
+    
+    # Initialize Gaussian count tracking
+    prev_gaussian_count = gaussians.get_xyz.shape[0]
+
+    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+    iter_start = torch.cuda.Event(enable_timing = True)
+    iter_end = torch.cuda.Event(enable_timing = True)
+
+    trainCameras = scene.getTrainCameras().copy()
+    testCameras = scene.getTestCameras().copy()
+    allCameras = trainCameras + testCameras
+    
+    # Display COLMAP scene quality info in table
+    scene_table = Table(title="[bold cyan]COLMAP Scene Info[/bold cyan]", 
+                       show_header=True, header_style="bold cyan", border_style="cyan", width=80)
+    scene_table.add_column("Property", style="cyan", justify="left", width=30)
+    scene_table.add_column("Value", style="yellow bold", justify="right", width=20)
+    scene_table.add_column("Notes", style="dim", justify="left", width=30)
+    
+    num_points = gaussians.get_xyz.shape[0]
+    scene_table.add_row("Initial 3D Points", f"{num_points:,}", "From COLMAP reconstruction")
+    scene_table.add_row("Training Cameras", f"{len(trainCameras)}", "Used for training Gaussians")
+    scene_table.add_row("Test Cameras", f"{len(testCameras)}", "Used for validation/metrics")
+    scene_table.add_row("Scene Extent", f"{scene.cameras_extent:.2f} units", "Bounding sphere radius")
+    
+    if trainCameras:
+        # Calculate camera intrinsics
+        avg_fovx = sum(cam.FoVx for cam in trainCameras) / len(trainCameras)
+        avg_fovy = sum(cam.FoVy for cam in trainCameras) / len(trainCameras)
+        
+        # Calculate focal length in pixels (fx = width / (2 * tan(fov_x / 2)))
+        focal_lengths_x = [cam.image_width / (2 * np.tan(cam.FoVx / 2)) for cam in trainCameras]
+        focal_lengths_y = [cam.image_height / (2 * np.tan(cam.FoVy / 2)) for cam in trainCameras]
+        avg_fx = sum(focal_lengths_x) / len(focal_lengths_x)
+        avg_fy = sum(focal_lengths_y) / len(focal_lengths_y)
+        
+        # Image dimensions (check if they vary)
+        widths = set(cam.image_width for cam in trainCameras)
+        heights = set(cam.image_height for cam in trainCameras)
+        
+        if len(widths) == 1 and len(heights) == 1:
+            img_dims = f"{list(widths)[0]} × {list(heights)[0]} px"
+        else:
+            img_dims = f"{min(widths)}-{max(widths)} × {min(heights)}-{max(heights)} px"
+        
+        scene_table.add_row("Image Dimensions", img_dims, "Camera sensor resolution")
+        scene_table.add_row("Average FoV", f"{np.rad2deg(avg_fovx):.1f}° × {np.rad2deg(avg_fovy):.1f}°", "Horizontal × Vertical")
+        scene_table.add_row("Focal Length (avg)", f"{avg_fx:.1f} × {avg_fy:.1f} px", "fx × fy in pixels")
+    
+    log.log()
+    log.print_table(scene_table)
+    
+    # Clear VRAM cache before training starts
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        gc.collect()
+        log.log("[green]✓ VRAM cache cleared[/green]")
+    
+    # highresolution index
+    highresolution_index = []
+    for index, camera in enumerate(trainCameras):
+        if camera.image_width >= 800:
+            highresolution_index.append(index)
+
+    # Display resolution info
+    first_cam = trainCameras[0] if trainCameras else None
+    if first_cam:
+        orig_w, orig_h = first_cam.image_width, first_cam.image_height
+        if dataset.resolution > 1:
+            train_w, train_h = orig_w // dataset.resolution, orig_h // dataset.resolution
+            log.log(f"[cyan]Image Resolution:[/cyan]")
+            log.log(f"  Original: {orig_w} × {orig_h} px")
+            log.log(f"  Training: [bold green]{train_w} × {train_h} px[/bold green] (downsampled by [yellow]-r {dataset.resolution}[/yellow])")
+            log.log(f"  [dim]Note: PSNR only comparable at SAME training resolution[/dim]")
+        else:
+            log.log(f"[cyan]Image Resolution:[/cyan] [bold green]{orig_w} × {orig_h} px[/bold green] (full resolution)")
+    
+    # Compute 3D filter with summary display
+    log.log(f"[cyan]Computing 3D filter for {len(trainCameras)} cameras[/cyan] (batched 8 cameras/batch)...")
+    gaussians.compute_3D_filter(cameras=trainCameras)
+
+    viewpoint_stack = None
+    ema_loss_for_log = 0.0
+    
+    # Use Rich Progress bar with resource monitoring
+    log.log(f"[green]Starting training...[/green]")
+    
+    # Test resource monitoring before progress bar
+    try:
+        test_resources = get_system_resources()
+        log.log(f"[dim]Initial - VRAM: {test_resources['vram_percent']:.0f}% ({test_resources['vram_gb']:.1f}GB), RAM: {test_resources['ram_percent']:.0f}% ({test_resources['ram_gb']:.1f}GB), CPU: {test_resources['cpu_percent']:.0f}%[/dim]")
+    except Exception as e:
+        log.log(f"[red]Warning: Resource monitoring failed: {e}[/red]")
+    
+    # Training loop without progress bar - use simple text updates
+    log.log("")
+    log.log("[bold cyan]═══════════════════════════════════════════════════════════════════════[/bold cyan]")
+    log.log("[bold cyan]                           TRAINING STARTED                              [/bold cyan]")
+    log.log("[bold cyan]═══════════════════════════════════════════════════════════════════════[/bold cyan]")
+    log.log("")
+    
+    first_iter += 1
+    start_time = time.time()
+    for iteration in range(first_iter, opt.iterations + 1):        
+        if network_gui.conn == None:
+            network_gui.try_connect()
+        while network_gui.conn != None:
+            try:
+                net_image_bytes = None
+                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
+                if custom_cam != None:
+                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
+                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
+                network_gui.send(net_image_bytes, dataset.source_path)
+                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
+                    break
+            except Exception as e:
+                network_gui.conn = None
+
+        iter_start.record()
+
+        gaussians.update_learning_rate(iteration)
+
+            # Every 1000 its we increase the levels of SH up to a maximum degree
+            if iteration % 1000 == 0:
+                gaussians.oneupSHdegree()
+
+            # Pick a random Camera
+            if not viewpoint_stack:
+                viewpoint_stack = scene.getTrainCameras().copy()
+            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+            
+            # Pick a random high resolution camera
+            if random.random() < 0.3 and dataset.sample_more_highres:
+                viewpoint_cam = trainCameras[highresolution_index[randint(0, len(highresolution_index)-1)]]
+                
+            # Render
+            if (iteration - 1) == debug_from:
+                pipe.debug = True
+
+            #TODO ignore border pixels
+            if dataset.ray_jitter:
+                subpixel_offset = torch.rand((int(viewpoint_cam.image_height), int(viewpoint_cam.image_width), 2), dtype=torch.float32, device="cuda") - 0.5
+                # subpixel_offset *= 0.0
+            else:
+                subpixel_offset = None
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background, kernel_size=dataset.kernel_size, subpixel_offset=subpixel_offset)
+            image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+
+            # Loss
+            gt_image = viewpoint_cam.original_image.cuda()
+            # sample gt_image with subpixel offset
+            if dataset.resample_gt_image:
+                gt_image = create_offset_gt(gt_image, subpixel_offset)
+
+            Ll1 = l1_loss(image, gt_image)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+            loss.backward()
+
+            iter_end.record()
+
+            with torch.no_grad():
+                # Update loss and resources every iteration
+                ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+                
+                # Print status every iteration (or every N iterations to reduce spam)
+                if iteration % 1 == 0:  # Change to higher value if too much output
+                    resources = get_system_resources()
+                    elapsed = time.time() - start_time
+                    elapsed_str = time.strftime('%H:%M:%S', time.gmtime(elapsed))
+                    
+                    # Estimate remaining time
+                    its_done = iteration - first_iter + 1
+                    its_remaining = opt.iterations - iteration
+                    if its_done > 0:
+                        avg_time_per_it = elapsed / its_done
+                        eta_seconds = avg_time_per_it * its_remaining
+                        eta_str = time.strftime('%H:%M:%S', time.gmtime(eta_seconds))
+                    else:
+                        eta_str = "--:--:--"
+                    
+                    # Calculate it/s
+                    if elapsed > 0:
+                        its_per_sec = its_done / elapsed
+                        its_str = f"{its_per_sec:.2f} it/s"
+                    else:
+                        its_str = "-- it/s"
+                    
+                    log.log(
+                        f"Iter [cyan]{iteration:>5}/{opt.iterations}[/cyan] │ "
+                        f"Loss: [magenta]{ema_loss_for_log:.4f}[/magenta] │ "
+                        f"VRAM: [cyan]{resources['vram_percent']:>2.0f}% ({resources['vram_gb']:>4.1f}GB)[/cyan] │ "
+                        f"RAM: [yellow]{resources['ram_percent']:>2.0f}% ({resources['ram_gb']:>4.1f}GB)[/yellow] │ "
+                        f"CPU: [green]{resources['cpu_percent']:>2.0f}%[/green] │ "
+                        f"{its_str} │ Elapsed: {elapsed_str} │ ETA: {eta_str}"
+                    )
+
+            # Log and save
+            enhanced_training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, dataset.kernel_size), gaussians)
+            
+            # Track Gaussian count changes (after densification)
+            if tb_writer and iteration > first_iter:
+                current_count = gaussians.get_xyz.shape[0]
+                count_change = current_count - prev_gaussian_count
+                
+                if count_change != 0:
+                    if count_change > 0:
+                        tb_writer.add_scalar('gaussians/added_K', count_change / 1000.0, iteration)
+                    else:
+                        tb_writer.add_scalar('gaussians/removed_K', -count_change / 1000.0, iteration)
+                    
+                    tb_writer.add_scalar('gaussians/net_change_K', count_change / 1000.0, iteration)
+                
+                prev_gaussian_count = current_count
+            
+            # Progress table (every 5000 iterations)
+            if iteration % 5000 == 0 and iteration > 0:
+                elapsed_min = (iter_start.elapsed_time(iter_end) * iteration) / 60000.0
+                remaining_iters = opt.iterations - iteration
+                eta_min = (iter_start.elapsed_time(iter_end) * remaining_iters) / 60000.0
+                fps = 1000.0 / iter_start.elapsed_time(iter_end) if iter_start.elapsed_time(iter_end) > 0 else 0
+                gpu_gb = torch.cuda.memory_allocated() / (1024**3) if torch.cuda.is_available() else 0
+                
+                # Create progress table
+                progress_table = Table(title=f"[bold cyan]Training Progress - Iteration {iteration:,}[/bold cyan]", 
+                                     show_header=True, header_style="bold magenta", border_style="cyan")
+                progress_table.add_column("Metric", style="cyan", justify="left")
+                progress_table.add_column("Value", style="yellow", justify="right")
+                progress_table.add_column("Status", style="green", justify="center")
+                
+                progress_pct = 100.0 * iteration / opt.iterations
+                progress_table.add_row("Progress", f"{iteration:,} / {opt.iterations:,}", f"{progress_pct:.1f}%")
+                progress_table.add_row("Time Elapsed", f"{elapsed_min:.1f} min", f"ETA: {eta_min:.1f} min")
+                progress_table.add_row("Loss (EMA)", f"{ema_loss_for_log:.4f}", "")
+                progress_table.add_row("Gaussians", f"{gaussians.get_xyz.shape[0]:,}", f"{gaussians.get_xyz.shape[0]/1000.0:.1f}K")
+                progress_table.add_row("GPU Memory", f"{gpu_gb:.2f} GB", "")
+                progress_table.add_row("Speed", f"{fps:.2f} it/s", "")
+                
+                log.print_table(progress_table)
+            
+            if (iteration in saving_iterations):
+                log.log(f"[green bold]Iter {iteration}: Saving Gaussians[/green bold]")
+                scene.save(iteration)
+
+            # Densification
+            if iteration < opt.densify_until_iter:
+                # Keep track of max radii in image-space for pruning
+                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+                    log.log(f"[cyan]Iter {iteration}: Densification complete, updating 3D filter[/cyan]")
+                    gaussians.compute_3D_filter(cameras=trainCameras)
+
+                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                    gaussians.reset_opacity()
+                    log.log(f"[cyan]Iter {iteration}: Resetting opacity, updating 3D filter[/cyan]")
+                    gaussians.compute_3D_filter(cameras=trainCameras)
+
+            if iteration % 100 == 0 and iteration > opt.densify_until_iter:
+                if iteration < opt.iterations - 100:
+                    # don't update in the end of training
+                    log.log(f"[cyan]Iter {iteration}: Updating 3D filter[/cyan]")
+                    gaussians.compute_3D_filter(cameras=trainCameras)
+        
+            # Optimizer step
+            if iteration < opt.iterations:
+                gaussians.optimizer.step()
+                gaussians.optimizer.zero_grad(set_to_none = True)
+                
+            # Periodic memory cleanup every 100 iterations
+            if iteration % 100 == 0:
+                gc.collect()
+            
+            # Memory cleanup - prevent VRAM creep
+            del render_pkg, image, gt_image, viewspace_point_tensor, visibility_filter, radii
+            del Ll1, loss
+            if subpixel_offset is not None:
+                del subpixel_offset
+            if iteration % 100 == 0:
+                torch.cuda.empty_cache()
+
+            if (iteration in checkpoint_iterations):
+                checkpoint_path = scene.model_path + "/chkpnt" + str(iteration) + ".pth"
+                log.log(f"[blue bold]Iter {iteration}: Saving Checkpoint[/blue bold]")
+                log.log(f"  → {checkpoint_path}")
+                torch.save((gaussians.capture(), iteration), checkpoint_path)
+
+def prepare_output_and_logger(args):    
+    if not args.model_path:
+        # Default: create output folder next to input dataset
+        # e.g., /path/to/garden -> /path/to/garden_output/experiment_name/
+        dataset_path = args.source_path.rstrip('/')
+        output_base = f"{dataset_path}_output"
+        
+        # Use experiment_name if provided, otherwise use timestamp
+        if hasattr(args, 'experiment_name') and args.experiment_name:
+            args.model_path = os.path.join(output_base, args.experiment_name)
+        else:
+            # No experiment name - use timestamp to create unique folder
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            args.model_path = os.path.join(output_base, timestamp_str)
+    
+    # Check if output folder already exists
+    if os.path.exists(args.model_path):
+        import shutil
+        log.log(f"[yellow bold]⚠️  Output folder already exists:[/yellow bold]")
+        log.log(f"[yellow]   {args.model_path}[/yellow]")
+        
+        # Check if it has content
+        dir_contents = os.listdir(args.model_path)
+        if dir_contents:
+            log.log(f"[yellow]Folder contains {len(dir_contents)} items[/yellow]")
+        
+        response = input("Delete existing folder and continue? [y/N]: ").strip().lower()
+        
+        if response == 'y' or response == 'yes':
+            log.log(f"[red]Deleting existing folder...[/red]")
+            shutil.rmtree(args.model_path)
+            log.log(f"[green]✓ Folder deleted[/green]")
+        else:
+            log.log(f"[red]Training cancelled by user.[/red]")
+            log.log(f"[dim]Tip: Use --experiment_name to create a unique output folder[/dim]")
+            sys.exit(0)
+        
+    # Set up output folder
+    log.log(f"[bold]Output folder:[/bold] {args.model_path}")
+    os.makedirs(args.model_path, exist_ok = True)
+    with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
+        cfg_log_f.write(str(Namespace(**vars(args))))
+
+    # Create Tensorboard writer
+    tb_writer = None
+    if TENSORBOARD_FOUND:
+        tb_writer = SummaryWriter(args.model_path)
+        
+        # Determine TensorBoard logdir (parent for comparison, or specific run)
+        parent_dir = os.path.dirname(args.model_path)
+        if parent_dir and os.path.basename(parent_dir).endswith('_output'):
+            # Using automatic naming - show parent directory for run comparison
+            tb_logdir = parent_dir
+            comparison_note = " (compare multiple runs)"
+        else:
+            # Using manual path - show specific directory
+            tb_logdir = args.model_path
+            comparison_note = ""
+        
+        log.log("[cyan]TensorBoard:[/cyan] Please open in another terminal:")
+        log.log(f"[dim]  tensorboard --logdir \"{tb_logdir}\" --port 6006 --bind_all[/dim]")
+        log.log(f"[dim]  Then open: http://localhost:6006[/dim]")
+        if comparison_note:
+            log.log(f"[dim]  Note: Logging to parent directory{comparison_note}[/dim]")
+    else:
+        log.log("[yellow]Tensorboard not available: not logging progress[/yellow]")
+    return tb_writer
+
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+    if tb_writer:
+        tb_writer.add_scalar('1_train/l1_loss', Ll1.item(), iteration)
+        tb_writer.add_scalar('1_train/total_loss', loss.item(), iteration)
+        tb_writer.add_scalar('1_train/iter_time', elapsed, iteration)
+
+    # Report test and samples of training set
+    if iteration in testing_iterations:
+        torch.cuda.empty_cache()
+        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
+                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+
+        for config in validation_configs:
+            if config['cameras'] and len(config['cameras']) > 0:
+                l1_test = 0.0
+                psnr_test = 0.0
+                for idx, viewpoint in enumerate(config['cameras']):
+                    render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
+                    image = torch.clamp(render_pkg["render"], 0.0, 1.0)
+                    
+                    # Cache GT image on first use to avoid repeated GPU transfers
+                    if not hasattr(viewpoint, '_cached_gt_cuda'):
+                        viewpoint._cached_gt_cuda = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    gt_image = viewpoint._cached_gt_cuda
+                    
+                    if tb_writer and (idx < 5):
+                        # Move to CPU before logging to prevent GPU memory retention in TensorBoard
+                        image_cpu = image.detach().cpu()
+                        gt_image_cpu = gt_image.detach().cpu()
+                        
+                        # 1. RGB Render
+                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), 
+                                           image_cpu[None], global_step=iteration)
+                        
+                        # 2. Ground Truth (only first test iteration)
+                        if iteration == testing_iterations[0]:
+                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), 
+                                               gt_image_cpu[None], global_step=iteration)
+                        
+                        # 3. Error Map (L1 difference, red = high error, white/grey = low error)
+                        error = torch.abs(image - gt_image).mean(dim=0, keepdim=True)
+                        # Color scheme: R=error, G=1-error, B=1-error (red for errors, white for good)
+                        error_colored = torch.cat([error, 1.0 - error, 1.0 - error], dim=0)
+                        tb_writer.add_images(config['name'] + "_view_{}/error_map".format(viewpoint.image_name), 
+                                           error_colored.detach().cpu()[None], global_step=iteration)
+                        
+                        # 4. Gaussian density heat map (per-pixel gaussian coverage)
+                        # Shows how many gaussians contribute to each pixel (red=dense, blue=sparse)
+                        with torch.no_grad():
+                            # Normalize to 0-1 range for visualization
+                            # Use a simple proxy: areas with more variation have more gaussian coverage
+                            img_std = torch.std(image, dim=0, keepdim=True)
+                            density_proxy = torch.clamp(img_std * 5.0, 0.0, 1.0)  # Scale for visibility
+                            
+                            # Color scheme: red = high density, blue = low density
+                            density_colored = torch.cat([
+                                density_proxy,                    # Red channel (high density)
+                                torch.zeros_like(density_proxy),  # Green channel
+                                1.0 - density_proxy               # Blue channel (low density)
+                            ], dim=0)
+                            
+                        tb_writer.add_images(config['name'] + "_view_{}/gaussian_density_heatmap".format(viewpoint.image_name), 
+                                           density_colored.detach().cpu()[None], global_step=iteration)
+                        
+                        # Cleanup ALL visualization tensors
+                        del image_cpu, gt_image_cpu, error, error_colored, img_std, density_proxy, density_colored
+                    
+                    l1_test += l1_loss(image, gt_image).mean().double()
+                    psnr_test += psnr(image, gt_image).mean().double()
+                    
+                    # Comprehensive cleanup after each viewpoint
+                    del render_pkg, image
+                    
+                    # Force cache clear every 3 views instead of 5
+                    if idx % 3 == 0:
+                        torch.cuda.empty_cache()
+                psnr_test /= len(config['cameras'])
+                l1_test /= len(config['cameras'])
+                
+                # Create Rich table for metrics
+                table = Table(title=f"[bold cyan]Evaluation Results - Iteration {iteration}[/bold cyan]", 
+                             show_header=True, header_style="bold magenta", border_style="cyan")
+                table.add_column("Dataset", style="cyan", justify="center")
+                table.add_column("L1 Loss", style="yellow", justify="right")
+                table.add_column("PSNR (dB)", style="green", justify="right")
+                
+                table.add_row(
+                    config['name'].upper(),
+                    f"{l1_test:.6f}",
+                    f"{psnr_test:.2f}"
+                )
+                
+                log.print_table(table)
+                
+                if tb_writer:
+                    prefix = '2_test' if config['name'] == 'test' else '1_train'
+                    tb_writer.add_scalar(f"{prefix}/loss_viewpoint_l1", l1_test, iteration)
+                    tb_writer.add_scalar(f"{prefix}/loss_viewpoint_psnr", psnr_test, iteration)
+                
+                # Force Python garbage collection after evaluation
+                gc.collect()
+
+        if tb_writer:
+            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
+            tb_writer.add_scalar('1_train/total_points', scene.gaussians.get_xyz.shape[0], iteration)
+            # FLUSH after evaluation to free image/histogram buffers
+            tb_writer.flush()
+        torch.cuda.empty_cache()
+
+def enhanced_training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene, renderFunc, renderArgs, gaussians):
+    """Enhanced training report with additional performance and Gaussian statistics."""
+    # Call base training report first
+    training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene, renderFunc, renderArgs)
+    
+    if not tb_writer:
+        return
+    
+    # === Performance Metrics ===
+    if elapsed > 0:
+        fps = 1000.0 / elapsed  # elapsed is in ms
+        tb_writer.add_scalar('4_performance/fps', fps, iteration)
+        tb_writer.add_scalar('4_performance/ms_per_iter', elapsed, iteration)
+    
+    # GPU Memory (VRAM)
+    if torch.cuda.is_available():
+        vram_allocated_gb = torch.cuda.memory_allocated() / (1024**3)
+        vram_reserved_gb = torch.cuda.memory_reserved() / (1024**3)
+        tb_writer.add_scalar('4_performance/vram_allocated_GB', vram_allocated_gb, iteration)
+        tb_writer.add_scalar('4_performance/vram_reserved_GB', vram_reserved_gb, iteration)
+        
+        # Comprehensive GPU monitoring from nvidia-smi (every 1000 iterations)
+        if iteration % 1000 == 0:
+            try:
+                import subprocess
+                # Query: utilization, power, temperature, fan, clocks, throttle status
+                result = subprocess.run([
+                    'nvidia-smi', 
+                    '--query-gpu=utilization.gpu,utilization.memory,power.draw,power.limit,temperature.gpu,fan.speed,clocks.gr,clocks.sm,clocks.mem,pstate,clocks_event_reasons.hw_slowdown,clocks_event_reasons.sw_power_cap',
+                    '--format=csv,noheader,nounits'
+                ], capture_output=True, text=True, timeout=1)
+                
+                if result.returncode == 0:
+                    values = result.stdout.strip().split(',')
+                    if len(values) >= 12:
+                        # Utilization
+                        gpu_util = float(values[0].strip())
+                        mem_util = float(values[1].strip())
+                        tb_writer.add_scalar('4_performance/gpu_compute_percent', gpu_util, iteration)
+                        tb_writer.add_scalar('4_performance/gpu_memory_percent', mem_util, iteration)
+                        
+                        # Power
+                        power_draw = float(values[2].strip())
+                        power_limit = float(values[3].strip())
+                        tb_writer.add_scalar('4_performance/gpu_power_watts', power_draw, iteration)
+                        tb_writer.add_scalar('4_performance/gpu_power_percent', 100.0 * power_draw / power_limit if power_limit > 0 else 0, iteration)
+                        
+                        # Thermal
+                        temp_gpu = float(values[4].strip())
+                        tb_writer.add_scalar('4_performance/gpu_temperature_celsius', temp_gpu, iteration)
+                        
+                        # Fan (may be 0 if not available)
+                        try:
+                            fan_speed = float(values[5].strip())
+                            if fan_speed > 0:
+                                tb_writer.add_scalar('4_performance/fan_speed_percent', fan_speed, iteration)
+                        except:
+                            pass
+                        
+                        # Clock speeds
+                        clock_graphics = float(values[6].strip())
+                        clock_sm = float(values[7].strip())
+                        clock_memory = float(values[8].strip())
+                        tb_writer.add_scalar('4_performance/clock_graphics_mhz', clock_graphics, iteration)
+                        tb_writer.add_scalar('4_performance/clock_sm_mhz', clock_sm, iteration)
+                        tb_writer.add_scalar('4_performance/clock_memory_mhz', clock_memory, iteration)
+                        
+                        # Power state and throttle reasons
+                        pstate = values[9].strip()
+                        hw_slowdown = values[10].strip()
+                        sw_power_cap = values[11].strip()
+                        
+                        # Log throttle status (0 = not throttled, 1 = throttled)
+                        is_hw_throttled = 1.0 if hw_slowdown == "Active" else 0.0
+                        is_power_throttled = 1.0 if sw_power_cap == "Active" else 0.0
+                        tb_writer.add_scalar('4_performance/throttle_hw_slowdown', is_hw_throttled, iteration)
+                        tb_writer.add_scalar('4_performance/throttle_power_cap', is_power_throttled, iteration)
+                
+                # Clean up subprocess resources
+                del result
+            except:
+                pass  # Skip if nvidia-smi not available
+        
+        # PCIe info logged once at startup with main nvidia-smi query (already captured above)
+    
+    # System RAM usage
+    ram_info = psutil.virtual_memory()
+    ram_used_gb = ram_info.used / (1024**3)
+    ram_percent = ram_info.percent
+    tb_writer.add_scalar('4_performance/ram_used_GB', ram_used_gb, iteration)
+    tb_writer.add_scalar('4_performance/ram_percent', ram_percent, iteration)
+    
+    # === Gaussian Statistics ===
+    num_gaussians = gaussians.get_xyz.shape[0]
+    tb_writer.add_scalar('3_gaussians/total_count_K', num_gaussians / 1000.0, iteration)
+    
+    # Opacity statistics (detached to prevent gradient retention)
+    opacity = gaussians.get_opacity.detach()
+    tb_writer.add_scalar('3_gaussians/opacity_mean', opacity.mean().item(), iteration)
+    tb_writer.add_scalar('3_gaussians/opacity_max', opacity.max().item(), iteration)
+    tb_writer.add_scalar('3_gaussians/opacity_min', opacity.min().item(), iteration)
+    
+    # Count by opacity range
+    low_opacity = (opacity < 0.1).sum().item()
+    high_opacity = (opacity > 0.9).sum().item()
+    tb_writer.add_scalar('3_gaussians/low_opacity_count_K', low_opacity / 1000.0, iteration)
+    tb_writer.add_scalar('3_gaussians/high_opacity_count_K', high_opacity / 1000.0, iteration)
+    tb_writer.add_scalar('3_gaussians/low_opacity_percent', 100.0 * low_opacity / num_gaussians, iteration)
+    
+    # Scale statistics (detached)
+    scales = gaussians.get_scaling.detach()
+    tb_writer.add_scalar('3_gaussians/scale_mean', scales.mean().item(), iteration)
+    tb_writer.add_scalar('3_gaussians/scale_max', scales.max().item(), iteration)
+    tb_writer.add_scalar('3_gaussians/scale_min', scales.min().item(), iteration)
+    
+    # === Histograms (every 1000 iterations to reduce overhead) ===
+    if iteration % 1000 == 0:
+        # Downsample to max 10K samples to prevent memory accumulation
+        num_gaussians = scales.shape[0]
+        max_samples = min(10000, num_gaussians)
+        sample_indices = torch.randperm(num_gaussians, device='cuda')[:max_samples]
+        
+        # Scale histogram (downsampled and moved to CPU)
+        scale_sample = scales[sample_indices].cpu()
+        tb_writer.add_histogram("scene/scale_histogram", scale_sample, iteration)
+        del scale_sample
+        
+        # Rotation magnitude histogram (downsampled)
+        rotations = gaussians.get_rotation.detach()
+        rotation_mag = torch.norm(rotations[sample_indices], dim=1).cpu()
+        tb_writer.add_histogram("scene/rotation_magnitude_histogram", rotation_mag, iteration)
+        del rotations, rotation_mag
+        
+        # XYZ magnitude histogram (downsampled)
+        xyz = gaussians.get_xyz.detach()
+        xyz_mag = torch.norm(xyz[sample_indices], dim=1).cpu()
+        tb_writer.add_histogram("scene/xyz_magnitude_histogram", xyz_mag, iteration)
+        del xyz, xyz_mag, sample_indices
+        
+        # CRITICAL: Flush TensorBoard writer to disk to free memory
+        tb_writer.flush()
+    
+    # Cleanup
+    del opacity, scales
+
+def print_final_training_summary(model_path):
+    """Display comprehensive training summary with key metrics from TensorBoard logs."""
+    try:
+        from tensorboard.backend.event_processing import event_accumulator
+        
+        # Find the most recent TensorBoard event file
+        import glob
+        event_files = glob.glob(os.path.join(model_path, "events.out.tfevents.*"))
+        if not event_files:
+            log.log("[yellow]⚠️  No TensorBoard logs found - skipping summary[/yellow]")
+            return
+        
+        # Load the most recent event file
+        event_file = max(event_files, key=os.path.getmtime)
+        ea = event_accumulator.EventAccumulator(event_file)
+        ea.Reload()
+        
+        # Helper function to get final scalar value
+        def get_final_value(tag):
+            try:
+                if tag in ea.Tags()['scalars']:
+                    events = ea.Scalars(tag)
+                    if events:
+                        return events[-1].value
+            except:
+                pass
+            return None
+        
+        # Helper function to get test set metrics
+        def get_test_value(tag):
+            try:
+                if tag in ea.Tags()['scalars']:
+                    events = ea.Scalars(tag)
+                    # Get last test iteration value (not the very last which might be train)
+                    test_events = [e for e in events if '2_test' in tag or 'test' in tag]
+                    if test_events:
+                        return test_events[-1].value
+                    elif events:
+                        return events[-1].value
+            except:
+                pass
+            return None
+        
+        log.log("[cyan bold]Training Summary - Key Metrics[/cyan bold]")
+        
+        # === Table 1: Model Quality Metrics ===
+        # Try to get test metrics, fallback to train if not available
+        test_psnr = get_test_value('2_test/loss_viewpoint_psnr')
+        test_l1 = get_test_value('2_test/loss_viewpoint_l1')
+        train_psnr = get_final_value('1_train/loss_viewpoint_psnr')
+        train_l1 = get_final_value('1_train/loss_viewpoint_l1')
+        
+        # Use train metrics if test not available
+        display_psnr = test_psnr if test_psnr else train_psnr
+        display_l1 = test_l1 if test_l1 else train_l1
+        metric_source = "Test Set" if test_psnr else "Train Set"
+        
+        quality_table = Table(title=f"[bold green]Model Quality ({metric_source})[/bold green]", 
+                             show_header=True, header_style="bold magenta", border_style="green", width=115)
+        quality_table.add_column("Metric", style="cyan", justify="left", width=40)
+        quality_table.add_column("Final Value", style="yellow bold", justify="right", width=25)
+        quality_table.add_column("Target/Reference", style="dim", justify="right", width=50)
+        
+        # PSNR interpretation
+        psnr_quality = ""
+        if display_psnr:
+            if display_psnr >= 35:
+                psnr_quality = "✨ Excellent"
+            elif display_psnr >= 30:
+                psnr_quality = "✅ Very Good"
+            elif display_psnr >= 25:
+                psnr_quality = "⚡ Good"
+            else:
+                psnr_quality = "⚠️  Fair"
+        
+        quality_table.add_row(
+            "PSNR (Peak Signal-to-Noise Ratio)",
+            f"{display_psnr:.2f} dB" if display_psnr else "N/A",
+            f"{psnr_quality} | >30dB = very good, >35dB = excellent"
+        )
+        quality_table.add_row(
+            "L1 Loss",
+            f"{display_l1:.6f}" if display_l1 else "N/A",
+            "Lower is better | Pixel error magnitude"
+        )
+        
+
+        complexity_table = Table(title="[bold blue]Model Complexity[/bold blue]", 
+                                show_header=True, header_style="bold magenta", border_style="blue", width=115)
+        complexity_table.add_column("Metric", style="cyan", justify="left", width=40)
+        complexity_table.add_column("Final Value", style="yellow bold", justify="right", width=25)
+        complexity_table.add_column("Notes", style="dim", justify="right", width=50)
+        
+        total_gaussians = get_final_value('1_train/total_points')
+        opacity_mean = get_final_value('3_gaussians/opacity_mean')
+        
+        if total_gaussians:
+            complexity_table.add_row(
+                "Total Gaussians",
+                f"{int(total_gaussians):,}",
+                f"({total_gaussians/1000:.1f}K) | More = finer detail but slower"
+            )
+        
+        if opacity_mean:
+            complexity_table.add_row(
+                "Average Opacity",
+                f"{opacity_mean:.3f}",
+                "0=transparent, 1=opaque | Healthy range: 0.3-0.7"
+            )
+        
+        log.log()
+        log.print_table(complexity_table)
+        
+        # Performance table
+        perf_table = Table(title="[bold magenta]Training Performance[/bold magenta]", 
+                          show_header=True, header_style="bold magenta", border_style="magenta", width=115)
+        perf_table.add_column("Metric", style="cyan", justify="left", width=40)
+        perf_table.add_column("Value", style="yellow bold", justify="right", width=25)
+        perf_table.add_column("Status", style="dim", justify="right", width=50)
+        
+        final_loss = get_final_value('1_train/total_loss')
+        avg_iter_time = get_final_value('1_train/iter_time')
+        max_vram = get_final_value('4_performance/vram_allocated_GB')
+        
+        if final_loss:
+            perf_table.add_row("Final Training Loss", f"{final_loss:.6f}", "Lower = better convergence")
+        
+        if avg_iter_time:
+            fps = 1000.0 / avg_iter_time if avg_iter_time > 0 else 0
+            perf_table.add_row(
+                "Iteration Speed",
+                f"{fps:.2f} it/s",
+                f"({avg_iter_time:.1f} ms/iter)"
+            )
+        
+        if max_vram:
+            vram_status = "✅ Efficient" if max_vram < 14 else "⚠️  High" if max_vram < 15.5 else "🔴 Near Limit"
+            perf_table.add_row(
+                "Peak VRAM Usage",
+                f"{max_vram:.2f} GB",
+                f"{vram_status} | Target: <14GB for safety"
+            )
+        
+        log.log()
+        log.print_table(perf_table)
+        
+        # === Output Files ===
+        log.print_table(perf_table)
+        
+        # === Output Files ===tual saved files
+        import glob
+        ply_files = sorted(glob.glob(os.path.join(model_path, "point_cloud/iteration_*/point_cloud.ply")))
+        checkpoint_files = sorted(glob.glob(os.path.join(model_path, "chkpnt*.pth")))
+        
+        if ply_files:
+            for ply in ply_files[-3:]:  # Show last 3
+                rel_path = os.path.relpath(ply, model_path)
+                log.log(f"  • {rel_path}")
+        
+        if checkpoint_files:
+            for chk in checkpoint_files[-3:]:  # Show last 3
+                rel_path = os.path.relpath(chk, model_path)
+                log.log(f"  • {rel_path}")
+        
+        # Quick quality assessment (use display_psnr which falls back to train if test not available)
+        if display_psnr and display_psnr >= 30:
+            log.log("[green]✅ Training completed successfully with good quality results![/green]")
+        elif display_psnr and display_psnr >= 25:
+            log.log("[yellow]⚡ Training completed. Results are decent - consider more iterations or adjusting parameters.[/yellow]")
+        elif display_psnr:
+            log.log("[yellow]⚠️  Training completed but quality is lower than expected. Check dataset quality or training parameters.[/yellow]")
+        else:
+            log.log("Training completed. Check TensorBoard for detailed metrics.")
+        
+    except ImportError:
+        log.log("[yellow]⚠️  TensorBoard not available - install with: pip install tensorboard[/yellow]")
+    except Exception as e:
+        log.log(f"[yellow]⚠️  Could not generate training summary: {e}[/yellow]")
+
+if __name__ == "__main__":
+    # Set up command line argument parser
+    parser = ArgumentParser(description="Training script parameters")
+    lp = ModelParams(parser)
+    op = OptimizationParams(parser)
+    pp = PipelineParams(parser)
+    parser.add_argument('--ip', type=str, default="127.0.0.1")
+    parser.add_argument('--port', type=int, default=6009)
+    parser.add_argument('--debug_from', type=int, default=-1)
+    parser.add_argument('--detect_anomaly', action='store_true', default=False)
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--experiment_name", type=str, default=None, help="Name for this training run (appended to output path)")
+    args = parser.parse_args(sys.argv[1:])
+    args.save_iterations.append(args.iterations)
+    
+    # Initialize system state (RNG)
+    safe_state(args.quiet)
+
+    # Start GUI server, configure and run training
+    network_gui.init(args.ip, args.port)
+    torch.autograd.set_detect_anomaly(args.detect_anomaly)
+    
+    # Extract parameters and pass experiment_name to dataset
+    dataset_params = lp.extract(args)
+    # Preserve experiment_name from main args
+    dataset_params.experiment_name = args.experiment_name
+    
+    training(dataset_params, op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+
+    # All done
+    log.log("[green bold]Training complete.[/green bold]")
+    
+    # Display final training summary (use dataset_params.model_path which was set in training)
+    print_final_training_summary(dataset_params.model_path)

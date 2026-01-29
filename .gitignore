@@ -1,0 +1,285 @@
+# ==========================================
+# Personal/Private Files (Not for GitHub)
+# ==========================================
+NOGIT/
+LLM.MD
+REFACTOR_*
+TODO.MD
+Project.md.old
+
+# ==========================================
+# External Packages
+# ==========================================
+# NOTE: These folders ARE needed for installation but contain large 
+# external dependencies. They should be included in distribution archives.
+# 
+# REQUIRED for installation (contain patches/modifications):
+# - mip-splatting/    (MODIFIED - has RTX 5000 optimizations)
+# - nvdiffrast/       (needed for texture rendering)
+# - pytorch3d/        (needed for mesh operations & KNN)
+# - SuGaR/            (core project files)
+#
+# OPTIONAL (can be cloned separately):
+# supersplat/         (viewer only)
+# Scaffold-GS/        (alternative method, not used)
+
+supersplat/
+Scaffold-GS/
+
+# ==========================================
+# Old/Archive Files
+# ==========================================
+oldDOCS/
+BACKUP/
+DOCS/BACKUP/
+*.backup
+*.backup_*
+*.old
+*.archive_*
+
+# ==========================================
+# Python
+# ==========================================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyc
+
+# C extensions
+*.c.o
+*.cpp.o
+*.o
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Training outputs and logs
+output/
+outputs/
+logs/
+tensorboard/
+checkpoints/
+benchmark_logs/
+benchmark_reports/
+TOOLS/profiles/
+*.log
+*.ckpt
+*.pth
+*.pt
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ==========================================
+# Machine Learning / Training
+# ==========================================
+# Training outputs
+output/
+outputs/
+results/
+runs/
+logs/
+checkpoints/
+experiments/
+
+# Project-specific output directories
+SuGaR/output/
+mip-splatting/output/
+mip-splatting/outputs/
+
+# TensorBoard
+events.out.tfevents.*
+*.tfevents.*
+
+# Datasets (usually large)
+data/
+datasets/
+*.npy
+*.npz
+
+# Model checkpoints
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.h5
+*.hdf5
+
+# Point clouds and meshes
+*.ply
+*.obj
+*.stl
+*.glb
+*.gltf
+*.fbx
+
+# Images (training data)
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.tif
+
+# Videos
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# ==========================================
+# CUDA / C++ Build Artifacts
+# ==========================================
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lai
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+
+# CUDA
+*.cubin
+*.cu.o
+
+# ==========================================
+# IDE / Editor
+# ==========================================
+# VS Code
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+\#*\#
+.\#*
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# ==========================================
+# OS Generated
+# ==========================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+*~
+.directory
+.Trash-*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ==========================================
+# Project Specific
+# ==========================================
+
+# Training output folders
+SAMPLES/*_output/
+
+# Sample datasets (download separately - see SAMPLES.md)
+SAMPLES/garden/
+SAMPLES/bicycle/
+SAMPLES/COMPARE/
+SAMPLES/*/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Compressed files
+*.zip
+*.tar.gz
+*.rar
+*.7z

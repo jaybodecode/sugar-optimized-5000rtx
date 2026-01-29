@@ -1,0 +1,9 @@
+open3d
+plyfile
+ninja
+GPUtil
+opencv-python
+lpips
+psutil
+nvidia-ml-py
+
