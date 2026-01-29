@@ -108,55 +108,23 @@ iteration = iteration_to_load  # Properly resumes from checkpoint
 
 **Purpose:** Convert trained Gaussian point cloud into triangulated surface mesh.
 
-**Key Operations:**
-```python
-# Location: SuGaR/sugar_extractors/coarse_mesh.py
+**Pipeline Overview:**
+1. Load trained SuGaR checkpoint
+2. Prune low-opacity Gaussians (< 0.5)
+3. Extract 10M surface points from multiple camera views
+4. Split foreground/background regions
+5. Poisson surface reconstruction (depth=10)
+6. Mesh decimation (200K or 1M vertices)
+7. Optional: Project mesh onto surface points for detail preservation
+8. Save as .ply file with vertex colors and normals
 
-# 1. Load trained SuGaR model
-sugar = SuGaR.load(checkpoint_path)
+**Time:** ~5-10 minutes  
+**VRAM:** ~8-10 GB peak (with `mesh_extraction_resolution_factor=0.5`)
 
-# 2. Mesh Extraction KNN (Stage 2) - REQUIRED
-#    This is SEPARATE from Training KNN and CANNOT be cached
-print(f"Computing KNN K={knn_to_track} for {len(points):,} points...")
-knns = knn_points(points[None], points[None], K=16)
-# Time: ~2-4 minutes for 6M points
-
-# 3. Extract surface mesh using marching cubes or poisson
-mesh = extract_mesh_at_level(sugar, surface_level=0.3)
-
-# 4. Decimate to target vertex count
-mesh_decimated = decimate_mesh(mesh, target_vertices=1_000_000)
-
-# 5. Project mesh onto surface for better detail
-if project_mesh_on_surface_points:
-    mesh_projected = project_mesh(mesh_decimated, sugar.points)
-```
-
-**Mesh Extraction KNN (Stage 2):**
-- **When:** After training completes, before mesh extraction
-- **Purpose:** Build topology for mesh generation from FINAL trained positions
-- **K=16** neighbors for mesh connectivity
-- **Time:** ~2-4 minutes for 6M points
-- **VRAM:** ~2-3 GB temporary spike
-- **Cached:** NO - uses final trained positions (different from initial)
-- **Output:** "Computing KNN K=16 for 5,999,994 points..." (no color before fix)
-
-**Why Two Separate KNN Stages?**
-
-| Aspect | Training KNN (Stage 1) | Mesh Extraction KNN (Stage 2) |
-|--------|------------------------|-------------------------------|
-| **When** | Model initialization | After training completes |
-| **Purpose** | Training regularization | Mesh topology |
-| **Input Points** | Initial checkpoint positions | Final trained positions |
-| **Cached?** | ✅ Yes (in checkpoint) | ❌ No (depends on final training) |
-| **Time** | ~3-5 min (once) | ~2-4 min (always) |
-| **Output Message** | "✓ Using cached initialization..." | "Computing KNN K=16..." |
-
-**Why Mesh Extraction KNN Cannot Be Cached:**
-- Training moves Gaussian positions (optimization)
-- Final positions != initial positions
-- Mesh topology depends on final neighborhood relationships
-- Must recompute for accurate mesh connectivity
+**Key Bottlenecks:**
+- Surface point extraction: 3-5 min (50-60% of Phase 2 time)
+- Poisson reconstruction: 2-3 min (30-40%, CPU-bound)
+- Mesh decimation: 2-3 min (20-30%)
 
 **Mesh Extraction Outputs:**
 ```
@@ -166,9 +134,18 @@ checkpoint_path_mesh/
     ├── sugarcoarse_3Dgs40000_densityestim02_sdfnorm02/
     │   └── (training checkpoints)
     └── mesh/
-        ├── coarse_mesh_level0.3_decim1000000.ply  # Extracted mesh
-        └── coarse_mesh_level0.3_decim1000000_proj.ply  # Projected mesh
+        ├── coarse_mesh_level0.3_decim1000000.ply  # Extracted mesh (1M vertices)
+        └── coarse_mesh_level0.3_decim1000000_proj.ply  # Projected mesh (if enabled)
 ```
+
+**📖 For Complete Stage 2 Analysis:**  
+See **[SUGAR_TRAIN_MESH.MD](SUGAR_TRAIN_MESH.MD)** for comprehensive documentation including:
+- All 10 mesh extraction steps with code locations
+- VRAM usage and optimization strategies  
+- Parameter impact tables (quality vs speed vs VRAM)
+- Performance bottleneck analysis
+- Known issues and fixes
+- Recommended workflows for 16GB and 24GB+ VRAM
 
 ---
 
