@@ -12,7 +12,7 @@
 **Note:** All paths in this guide use relative paths from the cloned repository root.  
 The sample dataset is located at `SAMPLES/garden` and outputs will be saved to `SAMPLES/garden_output/<timestamp>`.
 
-**📦 Sample Dataset:** If using the included Garden scene, make sure you've cloned the SAMPLES submodule during installation (see [INSTALL.md](INSTALL.md) Step 6).
+**📦 Sample Dataset:** Sample datasets are **not included** in this repository. Download them separately following instructions in [SAMPLES.md](SAMPLES.md) and [INSTALL.md](INSTALL.md) Step 6.
 
 ---
 
